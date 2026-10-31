@@ -1,0 +1,392 @@
+# Unu-Classic Akku Reader RS485
+
+
+substitutions:
+  device_name: "unu-classic-akku-rs485"   # hostname, must be <=31 chars
+  device_friendly_name: "Unu-Classic-Akku-RS485-D07E19"
+  device_id_name: "unu_classic_akku_rs485_d07e19"
+  # BMS request without '~' and '\r'.
+  #   A (correct checksum, needed by TWS batteries): 210F4642E002FFFCF4
+  #   B (as sent by the tacho, wrong checksum):      210F4642E002FFFC94
+  bms_request: "210F4642E002FFFCF4"
+  bms_poll_interval: 3s   # used while the "Auto poll" switch is on
+  bms_max_failures: "3"   # unanswered polls in a row before the sensors go unavailable
+  nominal_capacity_ah: "28.5"   # Forsee FBALCO0047 nameplate, base for SOH
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${device_friendly_name}
+  comment: "UNU Classic Akku reader RS485"
+  build_path: "../config/esphome/build/${device_name}_build"
+
+esp8266:
+  board: nodemcu
+
+# Enable/Disable logging
+logger:
+  level: DEBUG
+  baud_rate: 0  # disable logging over UART – UART0 is the RS485 bus
+
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_api_key
+
+ota:
+  platform: esphome
+  encryption:
+
+wifi:
+  # No use_address: discovery is via mDNS (${device_name}.local).
+  # Set use_address once you know the IP if mDNS is flaky.
+  ssid: !secret librescoot_wifi_ssid
+  password: !secret librescoot_wifi_pw
+  reboot_timeout: 1min
+  min_auth_mode: WPA2
+  ap:
+    ssid: ${device_name}-ap
+    password: !secret librescoot_fallback_ap_pw
+
+captive_portal:
+
+# Web server disabled to save RAM; Home Assistant shows everything.
+# web_server:
+#   local: true
+#   version: 3
+#   port: 80
+#   auth:
+#     username: !secret librescoot_webserver_basic_auth_user
+#     password: !secret librescoot_webserver_basic_auth_pw
+#     type: digest
+
+globals:
+  - id: bms_pending       # request sent, no valid answer yet (cleared by the parser or the 500 ms check)
+    type: bool
+    initial_value: "false"
+  - id: bms_fail_count    # unanswered polls in a row
+    type: int
+    initial_value: "0"
+
+# MAX485 DE + RE (bridged): HIGH = transmit, LOW = receive
+output:
+  - platform: gpio
+    id: bms_de
+    pin: GPIO0
+
+uart:
+  id: bms_uart
+  tx_pin: GPIO1      # TX → DI
+  rx_pin: GPIO3      # RX ← RO
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256   # response is 130 chars
+  # The debugger reads the bus and hands each frame (up to '\r') to the parser below
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      delimiter: "\r"
+      bytes: 150        # response is 130 chars; also keeps a hex dump within one log line
+      timeout: 100ms
+    sequence:
+      - lambda: |-
+          static const char *const TAG = "unu_bms";
+
+          // Drop everything before '~'
+          size_t start = 0;
+          while (start < bytes.size() && bytes[start] != '~') start++;
+          if (start == bytes.size()) {
+            static char hex[format_hex_pretty_size(150)];
+            ESP_LOGE(TAG, "RX %u bytes without '~': %s", (unsigned) bytes.size(),
+                     format_hex_pretty_to(hex, bytes));
+            return;
+          }
+          std::string body(bytes.begin() + start + 1, bytes.end());
+          const bool has_cr = !body.empty() && body.back() == '\r';
+          if (has_cr) body.pop_back();
+
+          bool is_hex = (body.size() % 2) == 0;
+          for (char c : body) {
+            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) is_hex = false;
+          }
+          if (!is_hex) {
+            static char hex[format_hex_pretty_size(150)];
+            ESP_LOGE(TAG, "RX invalid (non-hex char or odd length), %u bytes: %s", (unsigned) bytes.size(),
+                     format_hex_pretty_to(hex, bytes));
+            return;
+          }
+          ESP_LOGD(TAG, "RX (%u chars): ~%s%s", (unsigned) body.size(), body.c_str(), has_cr ? "\\r" : "");
+          if (!has_cr) {
+            ESP_LOGE(TAG, "RX frame incomplete (no '\\r' within timeout / 150 bytes)");
+            return;
+          }
+          if (body.size() < 16) {
+            ESP_LOGE(TAG, "RX frame too short (%u chars)", (unsigned) body.size());
+            return;
+          }
+
+          auto nib = [](char c) -> uint8_t { return c <= '9' ? c - '0' : c - 'A' + 10; };
+          auto u8 = [&](size_t pos) -> uint8_t { return (nib(body[pos]) << 4) | nib(body[pos + 1]); };
+          auto u16 = [&](size_t pos) -> uint16_t { return (u8(pos) << 8) | u8(pos + 2); };
+
+          // CHKSUM: two's complement of the ASCII sum of everything between '~' and CHKSUM
+          const size_t n = body.size() - 4;
+          uint32_t sum = 0;
+          for (size_t j = 0; j < n; j++) sum += static_cast<uint8_t>(body[j]);
+          const uint16_t cks_calc = static_cast<uint16_t>(~sum + 1);
+          const uint16_t cks_recv = u16(n);
+
+          const uint8_t ver = u8(0), adr = u8(2), cid1 = u8(4), rtn = u8(6);
+          const uint16_t length = u16(8);
+          const uint16_t lenid = length & 0x0FFF;
+          const uint8_t lchk_recv = length >> 12;
+          const uint8_t lchk_calc = (~((lenid >> 8) + ((lenid >> 4) & 0xF) + (lenid & 0xF)) + 1) & 0xF;
+
+          // Request frame (tacho on the bus) – not ours to parse
+          if (rtn == 0x42 && length == 0xE002) {
+            ESP_LOGD(TAG, "RX is a request frame, ignored");
+            return;
+          }
+
+          ESP_LOGD(TAG, "Header: VER %02X ADR %02X CID1 %02X RTN %02X LENGTH %04X (LENID %u)",
+                   ver, adr, cid1, rtn, length, lenid);
+          if (cks_recv == cks_calc) {
+            ESP_LOGD(TAG, "Checksum OK: %04X", cks_recv);
+          } else {
+            ESP_LOGE(TAG, "Checksum mismatch: received %04X, computed %04X – values published anyway",
+                     cks_recv, cks_calc);
+          }
+          if (lchk_recv != lchk_calc) {
+            ESP_LOGE(TAG, "LENGTH checksum mismatch: received %X, computed %X", lchk_recv, lchk_calc);
+          }
+          const size_t info_chars = body.size() - 16;
+          if (lenid != info_chars) {
+            ESP_LOGE(TAG, "LENID %u does not match INFO length %u", lenid, (unsigned) info_chars);
+          }
+          if (rtn != 0x00) {
+            ESP_LOGE(TAG, "BMS returned error RTN %02X", rtn);
+            return;
+          }
+
+          // Structural parse of INFO via the counts M, K and P
+          const size_t info_len = info_chars / 2;
+          size_t i = 0;
+          bool ok = true;
+          auto take8 = [&]() -> uint8_t {
+            if (i + 1 > info_len) { ok = false; return 0; }
+            return u8(12 + 2 * i++);
+          };
+          auto take16 = [&]() -> uint16_t {
+            if (i + 2 > info_len) { ok = false; return 0; }
+            uint16_t v = u16(12 + 2 * i);
+            i += 2;
+            return v;
+          };
+
+          const uint8_t info0 = take8();
+          const uint8_t m = take8();
+          std::vector<uint16_t> cells;
+          for (uint8_t j = 0; j < m && ok; j++) cells.push_back(take16());
+          const uint8_t k = take8();
+          std::vector<int16_t> temps;
+          for (uint8_t j = 0; j < k && ok; j++) temps.push_back(static_cast<int16_t>(take16()));
+          const float current = static_cast<int16_t>(take16()) * 0.01f;
+          const float voltage = take16() * 0.01f;
+          const float remaining = take16() * 0.01f;
+          const uint8_t p = take8();
+          std::vector<uint16_t> items;
+          for (uint8_t j = 0; j < p && ok; j++) items.push_back(take16());
+
+          if (!ok) {
+            ESP_LOGE(TAG, "INFO truncated: layout needs more than %u bytes (M=%u K=%u P=%u)",
+                     (unsigned) info_len, m, k, p);
+            return;
+          }
+          if (i != info_len) {
+            ESP_LOGE(TAG, "INFO has %u bytes, layout uses %u (M=%u K=%u P=%u)",
+                     (unsigned) info_len, (unsigned) i, m, k, p);
+            return;
+          }
+          if (m != 14 || k != 5) {
+            ESP_LOGW(TAG, "Unexpected layout M=%u K=%u (expected 14/5), parsed structurally", m, k);
+          }
+
+          // Everything not exposed as a sensor goes to the log
+          ESP_LOGD(TAG, "INFO byte 0: %02X, M=%u K=%u P=%u", info0, m, k, p);
+          if (!cells.empty()) {
+            std::string list;
+            uint32_t csum = 0;
+            uint16_t cmin = 0xFFFF, cmax = 0;
+            char buf[8];
+            for (uint16_t c : cells) {
+              snprintf(buf, sizeof(buf), "%s%u", list.empty() ? "" : " ", c);
+              list += buf;
+              csum += c;
+              cmin = std::min(cmin, c);
+              cmax = std::max(cmax, c);
+            }
+            ESP_LOGD(TAG, "Cells mV: %s", list.c_str());
+            ESP_LOGD(TAG, "Cells: sum %u mV, min %u mV, max %u mV, delta %u mV",
+                     (unsigned) csum, cmin, cmax, cmax - cmin);
+          }
+          ESP_LOGD(TAG, "Remaining capacity: %.2f Ah", remaining);
+          if (p >= 1) {
+            const float full = items[0] * 0.01f;
+            ESP_LOGD(TAG, "Full capacity: %.2f Ah, SoC %.1f %%", full, full > 0 ? remaining / full * 100.0f : NAN);
+          }
+          for (uint8_t j = 2; j < p; j++) {
+            ESP_LOGD(TAG, "Item %u (unknown): %u (0x%04X)", j + 1, items[j], items[j]);
+          }
+
+          // Publish
+          sensor::Sensor *temp_sensors[] = {id(bms_temp_1), id(bms_temp_2), id(bms_temp_3),
+                                            id(bms_temp_4), id(bms_temp_5)};
+          for (size_t j = 0; j < 5; j++) {
+            temp_sensors[j]->publish_state(j < temps.size() ? temps[j] : NAN);
+          }
+          id(bms_current).publish_state(current);
+          id(bms_voltage).publish_state(voltage);
+          id(bms_cycles).publish_state(p >= 2 ? items[1] : NAN);
+          id(bms_soh).publish_state(p >= 1 ? items[0] * 0.01f / ${nominal_capacity_ah}f * 100.0f : NAN);
+
+          id(bms_pending) = false;
+          id(bms_fail_count) = 0;
+
+script:
+  # One poll: send the request, then check after 500 ms whether a valid answer came in
+  - id: bms_poll
+    mode: single
+    then:
+      - lambda: |-
+          static const char *const TAG = "unu_bms";
+
+          const char *req = "${bms_request}";
+          const size_t n = strlen(req) - 4;
+          uint32_t sum = 0;
+          for (size_t j = 0; j < n; j++) sum += static_cast<uint8_t>(req[j]);
+          const uint16_t cks_calc = static_cast<uint16_t>(~sum + 1);
+          ESP_LOGD(TAG, "TX (%u chars): ~%s\\r", (unsigned) strlen(req), req);
+          ESP_LOGD(TAG, "TX checksum: sent %s, correct %04X", req + n, cks_calc);
+
+          id(bms_pending) = true;
+          id(bms_de).turn_on();
+          id(bms_uart).write_byte('~');
+          id(bms_uart).write_str(req);
+          id(bms_uart).write_byte('\r');
+          id(bms_uart).flush();   // waits until the last byte is out
+          id(bms_de).turn_off();
+      - delay: 500ms
+      - lambda: |-
+          static const char *const TAG = "unu_bms";
+
+          if (!id(bms_pending)) return;
+          id(bms_pending) = false;
+          id(bms_fail_count)++;
+          ESP_LOGW(TAG, "No valid response within 500 ms (%d in a row)", id(bms_fail_count));
+          if (id(bms_fail_count) == ${bms_max_failures}) {
+            ESP_LOGW(TAG, "Marking sensors unavailable");
+            for (auto *s : {id(bms_temp_1), id(bms_temp_2), id(bms_temp_3), id(bms_temp_4),
+                            id(bms_temp_5), id(bms_current), id(bms_voltage), id(bms_cycles),
+                            id(bms_soh)}) {
+              s->publish_state(NAN);
+            }
+          }
+
+interval:
+  - interval: ${bms_poll_interval}
+    then:
+      - if:
+          condition:
+            switch.is_on: bms_autopoll
+          then:
+            - script.execute: bms_poll
+
+switch:
+  - platform: template
+    id: bms_autopoll
+    name: "Auto poll"
+    icon: "mdi:timer-sync-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+button:
+  - platform: template
+    name: "Poll now"
+    icon: "mdi:sync"
+    on_press:
+      - script.execute: bms_poll
+
+sensor:
+  - platform: template
+    id: bms_voltage
+    name: "Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: bms_current
+    name: "Current"   # sign convention unverified
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: bms_cycles
+    name: "Cycles"
+    icon: "mdi:battery-sync"
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bms_soh
+    name: "SOH"   # full capacity / nominal_capacity_ah
+    unit_of_measurement: "%"
+    icon: "mdi:battery-heart-variant"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: bms_temp_1
+    name: "Temperature 1"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bms_temp_2
+    name: "Temperature 2"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bms_temp_3
+    name: "Temperature 3"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bms_temp_4
+    name: "Temperature 4"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: bms_temp_5
+    name: "Temperature 5"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
