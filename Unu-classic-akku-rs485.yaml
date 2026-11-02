@@ -4,10 +4,9 @@
 substitutions:
   device_name: "unu-classic-akku-rs485"   # hostname, must be <=31 chars
   device_friendly_name: "Unu-Classic-Akku-RS485"
-  # BMS request without '~' and '\r'.
-  #   A (correct checksum, needed by TWS batteries): 210F4642E002FFFCF4
-  #   B (as sent by the tacho, wrong checksum):      210F4642E002FFFC94
-  bms_request: "210F4642E002FFFCF4"
+  # BMS request without '~' and '\r', chosen with the "Request variant" select
+  bms_request_a: "210F4642E002FFFCF4"   # correct checksum, needed by TWS batteries
+  bms_request_b: "210F4642E002FFFC94"   # as sent by the tacho, wrong checksum
   bms_poll_interval: 3s   # used while the "Auto poll" switch is on
   bms_max_failures: "3"   # unanswered polls in a row before the sensors go unavailable
   nominal_capacity_ah: "28.5"   # Forsee FBALCO0047 nameplate, base for SOH
@@ -260,12 +259,13 @@ script:
       - lambda: |-
           static const char *const TAG = "unu_bms";
 
-          const char *req = "${bms_request}";
+          const bool variant_b = id(bms_variant).active_index().value_or(0) == 1;
+          const char *req = variant_b ? "${bms_request_b}" : "${bms_request_a}";
           const size_t n = strlen(req) - 4;
           uint32_t sum = 0;
           for (size_t j = 0; j < n; j++) sum += static_cast<uint8_t>(req[j]);
           const uint16_t cks_calc = static_cast<uint16_t>(~sum + 1);
-          ESP_LOGD(TAG, "TX (%u chars): ~%s\\r", (unsigned) strlen(req), req);
+          ESP_LOGD(TAG, "TX variant %c (%u chars): ~%s\\r", variant_b ? 'B' : 'A', (unsigned) strlen(req), req);
           ESP_LOGD(TAG, "TX checksum: sent %s, correct %04X", req + n, cks_calc);
 
           id(bms_pending) = true;
@@ -308,6 +308,18 @@ switch:
     icon: "mdi:timer-sync-outline"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
+
+select:
+  - platform: template
+    id: bms_variant
+    name: "Request variant"
+    icon: "mdi:swap-horizontal"
+    options:
+      - "A"   # bms_request_a
+      - "B"   # bms_request_b
+    initial_option: "A"
+    optimistic: true
+    restore_value: true
 
 button:
   - platform: template

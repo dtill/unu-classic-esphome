@@ -42,6 +42,7 @@ Home Assistant ◄── WiFi / ESPHome API ── D1 mini ── MAX485 ── 
 - Full request and response frames in the log, including checksums, so new
   battery variants can be analysed.
 - **Auto poll** switch (every 3 s, off by default) and **Poll now** button.
+- **Request variant** select (A / B) to switch the request frame without reflashing.
 - Sensors become *unavailable* after 3 unanswered polls in a row.
 
 ### File
@@ -109,7 +110,8 @@ All settings are `substitutions:` at the top of [`Unu-classic-akku-rs485.yaml`](
 
 | Substitution | Default | Meaning |
 |---|---|---|
-| `bms_request` | `210F4642E002FFFCF4` | request frame without `~` and `\r` (see below) |
+| `bms_request_a` | `210F4642E002FFFCF4` | request variant A without `~` and `\r` (see below) |
+| `bms_request_b` | `210F4642E002FFFC94` | request variant B without `~` and `\r` |
 | `bms_poll_interval` | `3s` | poll interval while **Auto poll** is on (default off) |
 | `bms_max_failures` | `3` | unanswered polls in a row before sensors go unavailable |
 | `nominal_capacity_ah` | `28.5` | nameplate capacity, base for SOH |
@@ -125,13 +127,14 @@ All settings are `substitutions:` at the top of [`Unu-classic-akku-rs485.yaml`](
 | Temperature 1–5 | °C | 1 °C resolution |
 | Auto poll | switch | polls every `bms_poll_interval`; **off by default**, state restored after reboot |
 | Poll now | button | sends a single request |
+| Request variant | select | `A` (default) or `B`; choice restored after reboot |
 
 #### DEBUG log
 
 Log tag `unu_bms`. One poll looks like this:
 
 ```
-[D][unu_bms]: TX (18 chars): ~210F4642E002FFFCF4\r
+[D][unu_bms]: TX variant A (18 chars): ~210F4642E002FFFCF4\r
 [D][unu_bms]: TX checksum: sent FCF4, correct FCF4
 [D][unu_bms]: RX (128 chars): ~210F46009070010E0FC10FBE…0BB8E4DC\r
 [D][unu_bms]: Header: VER 21 ADR 0F CID1 46 RTN 00 LENGTH 9070 (LENID 112)
@@ -175,8 +178,8 @@ The BMS speaks the ASCII-hex frame protocol of the Pylontech / PACE family
 | **A** (default) | `~210F4642E002FFFCF4\r` | correct checksum |
 | B | `~210F4642E002FFFC94\r` | what the scooter's dashboard sends – the checksum is wrong, but original BMSes answer anyway |
 
-Variant A worked on all tested batteries. Variant B is kept in the comments of [`Unu-classic-akku-rs485.yaml`](Unu-classic-akku-rs485.yaml) as
-a fallback.
+Switch between them with the **Request variant** select in Home Assistant.
+Variant A worked on all tested batteries; variant B also worked on battery 4.
 
 #### Response (INFO field)
 
@@ -196,20 +199,22 @@ Parsed structurally via the counts *M* (cells), *K* (temperatures) and *P*
 | item count P | u8 | 4 |
 | item 1: full capacity | u16 | 10 mAh |
 | item 2: cycle count | u16 | – |
-| item 3, item 4 | u16 | unknown (seen: 0 / 3000) |
+| item 3, item 4 | u16 | unknown (seen: 0 / 3000 or 2943 / 0) |
 
 ### Tested batteries
 
-Three original unu Classic batteries, all **Forsee FBALCO0047**
+Four original unu Classic batteries, all **Forsee FBALCO0047**
 (50.4 V, 28.5 Ah, 1436 Wh, 14S10P 18650 Li-ion):
 
-| Battery | Cycles | Full capacity | SOH | Cell delta (at rest, ~95 %) |
+| Battery | Cycles | Full capacity | SOH | Cell delta (at rest, 92–100 %) |
 |---|---|---|---|---|
 | 1 | 157 | 21.75 Ah | 76 % | 14 mV |
 | 2 | 65 | 19.99 Ah | 70 % | 12 mV |
 | 3 | 65 | 19.50 Ah | 68 % | 7 mV |
+| 4 | 32 | 27.50 Ah | 96.5 % | 26 mV |
 
-All three answered request variant A with valid frames.
+All four answered request variant A with valid frames. Battery 4 only answered
+after its LED button was pressed (see Troubleshooting).
 
 ### Limitations and open questions
 
@@ -219,8 +224,9 @@ All three answered request variant A with valid frames.
 - The role of the ignition pin (5) is not documented here. Forum reports say the
   main terminals sit at ~27 V until the battery is activated.
 - Current sign convention (charge vs. discharge) is not verified yet.
-- INFO byte 0 and items 3/4 are unknown. Item 4 is not the nameplate capacity
-  (3000 ≠ 2850) and not a temperature.
+- INFO byte 0 and items 3/4 are unknown. Two patterns were seen: item 3 = 0 /
+  item 4 = 3000, or item 3 ≈ 2943–3007 / item 4 = 0. Item 3 might be a BMS board
+  temperature in 0.1 K (2943 = 21.2 °C) – unverified.
 - Replacement batteries (e.g. TWS) may require variant A and may use a different
   layout – the structural parser and the raw frame log are meant to help with that.
 
@@ -228,7 +234,8 @@ All three answered request variant A with valid frames.
 
 No answer at all? Check in this order:
 
-1. Request variant (`bms_request`: try A, then B).
-2. A/B swapped – vendors label them differently.
-3. BMS not active (see limitations).
-4. RO wire reconnected after the USB flash?
+1. **Wake the battery:** press its LED button, then press **Poll now** within a
+   few seconds. Some batteries stay silent on RS485 until then.
+2. Request variant: try A, then B.
+3. A/B swapped – vendors label them differently.
+4. BMS not active (see limitations).
