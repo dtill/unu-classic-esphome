@@ -89,7 +89,7 @@ Notes:
 
 1. Install [ESPHome](https://esphome.io) (tested with **2026.10.1**).
 2. Put [`Unu-classic-akku-rs485.yaml`](Unu-classic-akku-rs485.yaml) into your ESPHome config folder.
-3. Create a `secrets.yaml` next to it with these keys:
+3. Add these keys to your `secrets.yaml`:
 
    ```yaml
    librescoot_api_key: "<32-byte base64 key, see esphome.io/components/api>"
@@ -98,23 +98,7 @@ Notes:
    librescoot_fallback_ap_pw: "<password for the fallback hotspot>"
    ```
 
-4. Adjust `build_path` in the `esphome:` block, or remove it to use ESPHome's
-   default.
-5. **First flash via USB.** Disconnect the RO wire (or unpower the MAX485) first –
-   while flashing, GPIO0 is LOW, the receiver is on and RO would disturb the upload.
-
-   ```bash
-   esphome run Unu-classic-akku-rs485.yaml --device /dev/ttyUSB0
-   ```
-
-6. Reconnect RO. From now on update over WiFi:
-
-   ```bash
-   esphome run Unu-classic-akku-rs485.yaml --device unu-classic-akku-rs485.local
-   esphome logs Unu-classic-akku-rs485.yaml --device unu-classic-akku-rs485.local
-   ```
-
-7. Add the device in Home Assistant (ESPHome integration, API encryption key).
+4. Flash the ESP board.
 
 > Without a Home Assistant connection the device reboots every 5 minutes
 > (`api: reboot_timeout: 5min`). That is ESPHome behaviour, not an RS485 problem.
@@ -125,9 +109,8 @@ All settings are `substitutions:` at the top of [`Unu-classic-akku-rs485.yaml`](
 
 | Substitution | Default | Meaning |
 |---|---|---|
-| `device_name` | `unu-classic-akku-rs485` | hostname / mDNS name |
 | `bms_request` | `210F4642E002FFFCF4` | request frame without `~` and `\r` (see below) |
-| `bms_poll_interval` | `3s` | poll interval while **Auto poll** is on |
+| `bms_poll_interval` | `3s` | poll interval while **Auto poll** is on (default off) |
 | `bms_max_failures` | `3` | unanswered polls in a row before sensors go unavailable |
 | `nominal_capacity_ah` | `28.5` | nameplate capacity, base for SOH |
 
@@ -234,8 +217,7 @@ All three answered request variant A with valid frames.
   dashboard already polls the battery every 0.5 s – two senders on the same bus
   collide. A listen-only mode is not implemented yet.
 - The role of the ignition pin (5) is not documented here. Forum reports say the
-  main terminals sit at ~27 V until the battery is activated; activating it switches
-  on full pack output – that is your call, not something this project does.
+  main terminals sit at ~27 V until the battery is activated.
 - Current sign convention (charge vs. discharge) is not verified yet.
 - INFO byte 0 and items 3/4 are unknown. Item 4 is not the nameplate capacity
   (3000 ≠ 2850) and not a temperature.
